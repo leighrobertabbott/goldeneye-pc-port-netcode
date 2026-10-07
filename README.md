@@ -6,7 +6,7 @@
 <p align="center"><em>GoldenEye 007 (Nintendo 64, 1997) on the PC —
 decompiled, ported, and playable at 60 fps.</em></p>
 
-[Download](#download) · [News](#news) · [Status](#status) · [Roadmap](#roadmap) · [Building](#building) · [Docs](#documentation) · [Legal](#legal)
+[Download](#download) · [News](#news) · [Status](#status) · [Online](#online-multiplayer) · [Roadmap](#roadmap) · [Building](#building) · [Docs](#documentation) · [Legal](#legal)
 
 A native PC port of _GoldenEye 007_ (Rare, 1997, Nintendo 64), compiled from
 the [GoldenEye 007 decompilation](https://github.com/n64decomp/007): the
@@ -138,8 +138,10 @@ it with **F9**, or **Online** on the file-select screen.
   under AddressSanitizer against hostile hosts and joiners. **Not yet
   tested:** a real match in the game, and connecting across home routers.
 
-See [`docs/netplay.md`](docs/netplay.md) (design: D413 / D414 / D415 / D416,
-[`docs/dev/NETPLAY-PLAN.md`](docs/dev/NETPLAY-PLAN.md)).
+How the netcode works: [Online multiplayer](#online-multiplayer). How to
+play: [`docs/netplay.md`](docs/netplay.md). Design:
+[`docs/dev/NETPLAY-PLAN.md`](docs/dev/NETPLAY-PLAN.md) and findings
+D413 / D414 / D415 / D416.
 
 **Working:** boot sequence and front end (menu → mission select → briefing →
 start), front-end menu navigation on the left stick to match the F10 overlay
@@ -229,10 +231,11 @@ directionally, on the way to v1.0:
 - **Controller (pad) button rebinding UI** (keyboard/mouse rebinding shipped
   in v0.4.0), and macOS/ARM builds.
 - **Online multiplayer** (online service, LAN, direct and own-server play,
-  each player on their own PC): first implementation in the tree
-  ([`docs/netplay.md`](docs/netplay.md)). Next:
+  each player on their own PC): first implementation in the tree, with a
+  public online service running ([Online multiplayer](#online-multiplayer)).
+  Next:
   - real-match and home-router testing;
-  - deploying the online service;
+  - a relay fallback for routers that can't be hole-punched;
   - a full-height 2-player view;
   - MP cheats in the lobby.
 - General polish: performance, remaining rendering/audio defects, save/config
@@ -441,10 +444,173 @@ port/
   fast3d/           software RSP -> OpenGL
   src/              port layer (main, OS shims, video, audio, input, fs, ...)
   include/          port-facing headers
+  net/              online multiplayer: network core (see below)
 tools/  Makefile    the N64 build + asset extraction (from the decomp; do not modify)
 tools_pc/           PC-port helper + analysis scripts
+  netplay/          matchmaking server, netplay self-test + fuzzer, online service
 docs/               see below
 ```
+
+---
+
+## Online multiplayer
+
+Up to four players, each on their own PC with their own full-window view,
+playing GoldenEye's multiplayer over LAN or the internet. It is new in the
+source tree and not yet play-tested; see [Status](#status). How to play:
+[`docs/netplay.md`](docs/netplay.md).
+
+### Deterministic lockstep
+
+GoldenEye's simulation is deterministic. The same starting state and the same
+controller input give the same game, frame for frame. So the PCs never
+exchange game state: every PC runs the complete, unmodified game, and only
+controller input crosses the network.
+
+- **Input bundles.** Each frame, every PC samples its own player's input for
+  frame *f + D* and sends it to the host. The host gathers one input per
+  player per frame into a **bundle** and relays the bundles to everyone. A PC
+  plays frame *f* only once it holds bundle *f*, so every PC feeds the game
+  the same input in the same order.
+- **Input delay.** *D* is chosen per match from the measured ping:
+  the slowest round trip in 60 Hz frames, plus 2, at most 12 frames
+  (200 ms). It can also be set in the lobby. The delay hides network
+  latency. A late bundle pauses the game briefly rather than letting PCs
+  diverge, and a waiting screen shows who is holding things up.
+- **Desync check.** Every 30 frames each PC sends a hash of its state. The
+  host compares them and tells everyone the frame where they diverged.
+- **Dropouts.** If a player disconnects, or stops sending input for 15 s,
+  the host switches that player to neutral input from the same frame on
+  every PC, and the match carries on for the others.
+
+### The same start on every PC
+
+Netplay adds one `#ifdef PORT` call to the game's code: `netgameOnStageLoad`
+in `src/boss.c`, at the top of the per-stage loop, before the stage's first
+random number. It does nothing outside a network match. When a match starts
+it:
+
+- writes everything the game's own RAMROM demo system treats as a stage's
+  starting state: seeds, the agreed multiplayer setup, save options and
+  cheats;
+- installs the controller playback hook (`joySetPlaybackFunc`, the seam the
+  game uses to play back demos);
+- switches the game's clock to frame-locked time, so no wall-clock value
+  reaches the simulation.
+
+Port settings that would change which game code runs, such as the aspect
+ratio, control style and aim settings, are pinned for the match.
+
+### Your own view, PC controls
+
+- **One view per PC.** Every PC still simulates and renders every player's
+  view, because the game interleaves simulation with each player's render
+  pass. It presents only its own player, scaled to the full window; the
+  other views are skipped before any GL work (`port/fast3d/gfx_pc.cpp`).
+- **PC controls.** Mouse look, the GEPD-style crosshair, free crouch, and
+  the dedicated reload and gadget buttons travel in the input record and are
+  replayed on every PC (`port/src/input.c`), so PC-style aiming works
+  online.
+
+### Network layer (`port/net/`)
+
+- **Self-contained.** Plain C11 over UDP, with no game code: the host, the
+  matchmaking server and the self-test build without the game.
+- **Session layer.** Each peer connection carries reliable, ordered messages
+  (lobby, match start) alongside unreliable ones (input, bundles), plus a
+  keepalive and round-trip measurement.
+- **Same build only.** Only identical builds play together: the same version,
+  ROM region, platform and protocol.
+- **No amplification.** Join requests are padded to 256 bytes, larger than
+  any reply, so a host can't be used to amplify traffic.
+
+### Finding a game
+
+There are four ways to connect:
+
+- **the online service;**
+- **LAN,** found by a broadcast on the local network;
+- **direct connect,** where the host forwards UDP port 27007;
+- **your own server** (`ge007-netserver`). It carries the game traffic, so
+  it works behind any router.
+
+The **online service** (`tools_pc/netplay/cloudflare`) is a Cloudflare
+Worker with one Durable Object, on the free tier. It provides the game list,
+6-letter game codes, Quick Match and a live status page. It only introduces
+players, and matches never pass through it:
+
+1. The game learns its public address from Cloudflare's STUN server.
+2. The service hands each side the other's addresses.
+3. The host and the joiner punch through their routers towards each other
+   (UDP hole punching).
+
+**Quick Match** puts a searcher into an open game that fits their
+preferences: mode (team modes included), map, weapons, length and players,
+each of which can be "any". Games are ordered as follows:
+
+1. games nobody has failed to reach;
+2. then games on the searcher's continent;
+3. then the fullest;
+4. then the oldest.
+
+If no game fits, the searcher hosts one with their preferences as its rules.
+An unreachable game is skipped quietly, and after three the searcher hosts.
+Quick games start once everyone is ready: after 12 s with two players, 8 s
+with three, and 3 s when full.
+
+### Hardening
+
+Every peer is untrusted.
+
+- **Game side:**
+  - every packet is bounds-checked;
+  - every value the game will index a table with is range-checked;
+  - all text is forced to printable ASCII;
+  - input floats are made finite and bounded (the game's angle-wrap loop
+    would never finish on an infinite value).
+- **The service:**
+  - a player may only publish their own public address, so it can't be used
+    to aim traffic at anyone;
+  - lobby tokens are signed;
+  - match results are accepted only for matches the service saw;
+  - there are per-address and edge rate limits;
+  - it is HTTPS only.
+- **Fuzzing:** `tools_pc/netplay/netfuzz.c` attacks the real code under
+  AddressSanitizer with hostile hosts, hostile joiners, tampered packets and
+  garbage. The service has its own fuzz tests.
+
+### Testing
+
+- **`netplay_selftest`** plays whole lockstep matches on a simulated network
+  (loss, duplication, 20–200 ms latency). It checks that every client gets
+  byte-identical input and the same state on every frame. It also covers
+  desyncs, disconnects, aborts, rematches, a normal match end, matchmaking,
+  STUN and the online-service protocol.
+- **The service** has unit tests, an integration test against the game's
+  service client, and an end-to-end test with the real network runtime (one
+  process per player, plus a fake STUN server).
+- **Not yet tested:** a real match in the game, and connecting across real
+  home routers.
+
+### Where the code is
+
+```
+port/net/                    sockets, wire protocol, session layer, host / client,
+                             lockstep relay, STUN, online-service client
+port/src/netgame.c           game glue: match start, playback hook, waiting screen
+port/src/netui.c             the F9 lobby
+port/src/input.c             input records for lockstep (PC aim, crouch, ...)
+tools_pc/netplay/            ge007-netserver, netplay_selftest, netfuzz, test tools
+tools_pc/netplay/cloudflare/ the online service and its status page
+```
+
+More detail:
+
+- [`docs/netplay.md`](docs/netplay.md): the player guide;
+- [`docs/dev/NETPLAY-PLAN.md`](docs/dev/NETPLAY-PLAN.md): the design;
+- [`docs/porting-notes.md`](docs/porting-notes.md) §F: what breaks
+  determinism;
+- findings D413–D416 in [`docs/dev/findings.md`](docs/dev/findings.md).
 
 ---
 
